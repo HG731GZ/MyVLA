@@ -1,0 +1,8 @@
+/.codex
+/datasets/metas/
+/.idea
+/evaluation/libero/eval_results/
+/runs/
+/pretrained/
+/PLAN.md
+/具体代码计划.md

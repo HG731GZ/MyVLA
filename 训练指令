@@ -1,0 +1,136 @@
+# 当前版本训练指令
+
+当前代码只保留一种动作头：
+
+```text
+9层 × 768维 × 12头
+CrossAttention(VLM memory) -> SelfAttention(action chunk) -> MLP
+```
+
+第一轮实验只输入两张图：
+
+```text
+AgentView + WristView
+```
+
+训练数据为 `LIBERO_OBJECT`。参考图、四图角色编码和参考图 dropout 暂未启用。
+
+## 单卡训练
+
+```bash
+conda activate simvla
+
+# 如果训练机上的仓库路径不同，请修改这一行
+cd /home/hg731/HG/SimVLA-HG/SimVLA
+
+export PYTHONNOUSERSITE=1
+export CUDA_VISIBLE_DEVICES=0
+export NUM_PROCESSES=1
+export NUM_WORKERS=8
+export GRADIENT_ACCUMULATION_STEPS=1
+
+export SMOLVLM_MODEL=./pretrained/SmolVLM-500M-Instruct
+export VLM_TORCH_DTYPE=float32
+export LEARNING_RATE=1e-4
+
+bash train_smolvlm_small.sh \
+    32 \
+    0.1 \
+    ./runs/libero_object_cross_self
+```
+
+三个位置参数依次是：
+
+```text
+32                                每个 GPU/process 的 batch size
+0.1                               VLM 学习率系数
+./runs/libero_object_cross_self   输出目录
+```
+
+实际学习率：
+
+```text
+动作头学习率 = 1e-4
+VLM 解冻后学习率 = 1e-4 × 0.1 = 1e-5
+```
+
+VLM 前 1000 个 optimizer step 冻结，新动作头从第 1 步开始完整训练。
+
+如果显存不足，将 batch size 从 `32` 降到 `16` 或 `8`。也可以增加：
+
+```bash
+export GRADIENT_ACCUMULATION_STEPS=2
+```
+
+## 四卡训练
+
+```bash
+conda activate simvla
+cd /home/hg731/HG/SimVLA-HG/SimVLA
+
+export PYTHONNOUSERSITE=1
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export NUM_PROCESSES=4
+export NUM_WORKERS=8
+export GRADIENT_ACCUMULATION_STEPS=1
+
+export SMOLVLM_MODEL=./pretrained/SmolVLM-500M-Instruct
+export VLM_TORCH_DTYPE=float32
+export LEARNING_RATE=1e-4
+
+bash train_smolvlm_small.sh \
+    32 \
+    0.1 \
+    ./runs/libero_object_cross_self
+```
+
+此时有效全局 batch size 为：
+
+```text
+32 × 4 GPU × 1 梯度累积 = 128
+```
+
+## 修改训练步数
+
+默认训练 `800000` 个 optimizer step。通过环境变量修改：
+
+```bash
+export ITERS=400000
+```
+
+常用可调项：
+
+```bash
+export SAVE_INTERVAL=20000
+export LOG_INTERVAL=20
+export FREEZE_VLM_STEPS=1000
+export WARMUP_STEPS=0
+```
+
+## 从新结构 checkpoint 继续训练
+
+`ITERS` 表示最终总步数，不是额外增加的步数。
+
+```bash
+conda activate simvla
+cd /home/hg731/HG/SimVLA-HG/SimVLA
+
+export PYTHONNOUSERSITE=1
+export CUDA_VISIBLE_DEVICES=0
+export NUM_PROCESSES=1
+export NUM_WORKERS=8
+export GRADIENT_ACCUMULATION_STEPS=1
+
+export SMOLVLM_MODEL=./pretrained/SmolVLM-500M-Instruct
+export VLM_TORCH_DTYPE=float32
+export LEARNING_RATE=1e-4
+export ITERS=800000
+
+bash train_smolvlm_small.sh \
+    32 \
+    0.1 \
+    ./runs/libero_object_cross_self \
+    ./runs/libero_object_cross_self/ckpt-200000
+```
+
+只能加载当前 Cross-Self 结构产生的 checkpoint。旧动作头 checkpoint 不再兼容。
