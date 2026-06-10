@@ -21,13 +21,16 @@ AgentView + WristView
 conda activate simvla
 
 # 如果训练机上的仓库路径不同，请修改这一行
-cd /home/hg731/HG/SimVLA-HG/SimVLA
+cd /home/hg731/HG/MyVLA
 
 export PYTHONNOUSERSITE=1
 export CUDA_VISIBLE_DEVICES=0
 export NUM_PROCESSES=1
 export NUM_WORKERS=8
 export GRADIENT_ACCUMULATION_STEPS=1
+export SAVE_INTERVAL=20000
+export LOG_INTERVAL=10
+export ITERS=100000
 
 export SMOLVLM_MODEL=./pretrained/SmolVLM-500M-Instruct
 export VLM_TORCH_DTYPE=float32
