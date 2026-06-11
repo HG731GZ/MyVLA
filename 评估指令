@@ -1,32 +1,84 @@
-终端1：
+# 当前版本 LIBERO 评估指令
+
+当前 checkpoint 使用两视图 Cross-Self 网络：
+
+```text
+AgentView + WristView
+9层 CrossAttention -> SelfAttention -> MLP 动作头
+```
+
+评估需要同时打开两个终端：
+
+- 终端 1 使用 `simvla` 环境运行模型服务。
+- 终端 2 使用 `libero` 环境运行仿真评估。
+
+下面的命令默认从 MyVLA 仓库根目录执行。
+
+## 终端 1：启动模型服务
+# 本地 SmolVLM 路径因机器而异；也可以指向 Hugging Face 模型名称。
+
+```bash
 conda activate simvla
-cd /home/hg731/HG/SimVLA-HG/SimVLA
+cd /mnt/data/MyVLA
 
 export PYTHONNOUSERSITE=1
-CUDA_VISIBLE_DEVICES=0 python evaluation/libero/serve_smolvlm_libero.py \
-  --checkpoint runs/simvla_libero_all_small/ckpt-200000 \
-  --norm_stats norm_stats/libero_norm.json \
-  --smolvlm_model pretrained/SmolVLM-500M-Instruct \
-  --host 127.0.0.1 \
-  --port 8102
-  
+export CUDA_VISIBLE_DEVICES=0
+export SMOLVLM_MODEL_PATH=pretrained/SmolVLM-500M-Instruct
 
-终端2：
+python -u evaluation/libero/serve_smolvlm_libero.py \
+    --checkpoint runs/libero_object_cross_self/ckpt-20000 \
+    --norm_stats norm_stats/libero_object_norm.json \
+    --host 127.0.0.1 \
+    --port 8102
+```
+
+`--norm_stats` 可以省略，服务端会尝试从 checkpoint 的
+`training_config.json` 中解析。显式指定更直观，也能避免移动 checkpoint
+后找不到文件。
+
+默认使用 10 次 flow-matching Euler 去噪。如需快速检查链路，可临时增加：
+
+```bash
+--denoising_steps 1
+```
+
+正式评估建议保持默认值 10。
+
+
+## 终端 2：正式评估 LIBERO_OBJECT
+
+```bash
 conda activate libero
-cd /home/hg731/HG/SimVLA-HG/SimVLA/evaluation/libero
+cd /mnt/data/MyVLA
 
+export LIBERO_ROOT=/mnt/data/LIBERO
 export MUJOCO_GL=egl
-export LIBERO_ROOT=/home/hg731/HG/LIBERO
 
-python -u libero_client.py \
-  --host 127.0.0.1 \
-  --port 8102 \
-  --client_type websocket \
-  --task_suite libero_object \
-  --num_trials 5 \
-  --max_steps 500 \
-  --replan_steps 5 \
-  --video_out ./eval_results
-  
- 
- task_suite里面可以改成libero_goal等。
+python -u evaluation/libero/libero_client.py \
+    --libero_root "$LIBERO_ROOT" \
+    --host 127.0.0.1 \
+    --port 8102 \
+    --client_type websocket \
+    --task_suite libero_object \
+    --num_trials 20 \
+    --max_steps 500 \
+    --replan_steps 5 \
+    --video_out ./eval_results
+```
+
+当前 checkpoint 只使用 `LIBERO_OBJECT` 训练，因此应优先报告
+`libero_object` 结果。`--task_suite` 也支持：
+
+```text
+libero_spatial
+libero_goal
+libero_10
+libero_90
+```
+
+该脚本不再写死 LIBERO 路径，会读取 `LIBERO_ROOT`。如果 `python` 不是
+当前 `libero` 环境的解释器，也可以设置：
+
+```bash
+export PYTHON_BIN=/path/to/libero/env/bin/python
+```

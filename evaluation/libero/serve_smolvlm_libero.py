@@ -14,10 +14,12 @@ Action format (7D): [delta_xyz(3), delta_axisangle(3), gripper_cmd(1)]
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import sys
 import traceback
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -25,6 +27,7 @@ import numpy as np
 import torch
 from PIL import Image
 from torchvision import transforms
+from torchvision.transforms import InterpolationMode
 
 import websockets
 
@@ -46,9 +49,13 @@ from models.configuration_smolvlm_vla import SmolVLMVLAConfig
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_SMOLVLM_MODEL = "HuggingFaceTB/SmolVLM-500M-Instruct"
+
 # Global state
 model: Optional[SmolVLMVLA] = None
 processor: Optional[SmolVLMVLAProcessor] = None
+image_transform = None
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Configuration
@@ -56,20 +63,131 @@ CONFIG = {
     "state_dim": 8,
     "action_dim": 7,
     "action_horizon": 10,
+    "denoising_steps": 10,
     "image_size": 384,
 }
 
 
-def load_model(checkpoint_path: str, norm_stats_path: str = None, smolvlm_model_path: str = None):
+def _looks_like_local_path(value: str) -> bool:
+    return value.startswith((".", "/", "~")) or os.path.exists(os.path.expanduser(value))
+
+
+def _resolve_existing_path(value: str, bases) -> Optional[Path]:
+    path = Path(value).expanduser()
+    candidates = [path] if path.is_absolute() else [base / path for base in bases]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
+
+def _resolve_smolvlm_model_path(
+    checkpoint_path: Path,
+    configured_path: str,
+    override_path: Optional[str],
+) -> str:
+    explicit_path = override_path or os.environ.get("SMOLVLM_MODEL_PATH")
+    bases = (Path.cwd(), PROJECT_ROOT, checkpoint_path.parent)
+
+    if explicit_path:
+        resolved = _resolve_existing_path(explicit_path, bases)
+        if resolved is not None:
+            return str(resolved)
+        if _looks_like_local_path(explicit_path):
+            raise FileNotFoundError(
+                f"SmolVLM model path does not exist: {explicit_path}. "
+                "Pass --smolvlm_model or set SMOLVLM_MODEL_PATH."
+            )
+        return explicit_path
+
+    resolved = _resolve_existing_path(configured_path, bases)
+    if resolved is not None:
+        return str(resolved)
+    if configured_path and not _looks_like_local_path(configured_path):
+        return configured_path
+
+    logger.warning(
+        "Checkpoint SmolVLM path %r is not available on this machine; "
+        "falling back to %s. Set SMOLVLM_MODEL_PATH to use a local copy.",
+        configured_path,
+        DEFAULT_SMOLVLM_MODEL,
+    )
+    return DEFAULT_SMOLVLM_MODEL
+
+
+def _resolve_norm_stats_path(
+    checkpoint_path: Path,
+    override_path: Optional[str],
+) -> Path:
+    requested_path = override_path or os.environ.get("NORM_STATS_PATH")
+    bases = (Path.cwd(), PROJECT_ROOT, checkpoint_path.parent)
+
+    if requested_path:
+        resolved = _resolve_existing_path(requested_path, bases)
+        if resolved is None:
+            raise FileNotFoundError(f"Norm stats file does not exist: {requested_path}")
+        return resolved
+
+    training_config_path = checkpoint_path / "training_config.json"
+    if training_config_path.is_file():
+        with training_config_path.open() as f:
+            training_config = json.load(f)
+        configured_path = training_config.get("norm_stats_path")
+        if configured_path:
+            resolved = _resolve_existing_path(configured_path, bases)
+            if resolved is not None:
+                return resolved
+
+    raise FileNotFoundError(
+        "Normalization stats are required for LIBERO evaluation. Pass "
+        "--norm_stats, set NORM_STATS_PATH, or keep a valid norm_stats_path "
+        "in the checkpoint training_config.json."
+    )
+
+
+def _build_image_transform(image_size: int):
+    return transforms.Compose([
+        transforms.Resize(
+            (image_size, image_size),
+            interpolation=InterpolationMode.BICUBIC,
+            antialias=True,
+        ),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    ])
+
+
+def _autocast_context():
+    if model is None or torch.device(device).type != "cuda":
+        return nullcontext()
+    vlm_dtype = next(model.vlm.parameters()).dtype
+    if vlm_dtype in (torch.float16, torch.bfloat16):
+        return torch.autocast(device_type="cuda", dtype=vlm_dtype)
+    return nullcontext()
+
+
+def load_model(
+    checkpoint_path: str,
+    norm_stats_path: str = None,
+    smolvlm_model_path: str = None,
+    denoising_steps: int = 10,
+):
     """Load SimVLA model and processor."""
-    global model, processor
+    global model, processor, image_transform
     
     logger.info(f"Loading SimVLA from {checkpoint_path}...")
 
-    checkpoint_path = Path(checkpoint_path)
+    checkpoint_path = Path(checkpoint_path).expanduser().resolve()
+    if not checkpoint_path.is_dir():
+        raise FileNotFoundError(f"Checkpoint directory does not exist: {checkpoint_path}")
+
     config = SmolVLMVLAConfig.from_pretrained(checkpoint_path)
-    if smolvlm_model_path:
-        config.smolvlm_model_path = smolvlm_model_path
+    resolved_smolvlm_path = _resolve_smolvlm_model_path(
+        checkpoint_path,
+        config.smolvlm_model_path,
+        smolvlm_model_path,
+    )
+    config.smolvlm_model_path = resolved_smolvlm_path
 
     model = SmolVLMVLA(config)
     safetensors_path = checkpoint_path / "model.safetensors"
@@ -78,61 +196,71 @@ def load_model(checkpoint_path: str, norm_stats_path: str = None, smolvlm_model_
         from safetensors.torch import load_file
         state_dict = load_file(str(safetensors_path), device="cpu")
     elif pytorch_path.exists():
-        state_dict = torch.load(pytorch_path, map_location="cpu")
+        state_dict = torch.load(pytorch_path, map_location="cpu", weights_only=True)
     else:
         raise FileNotFoundError(f"No model.safetensors or pytorch_model.bin found in {checkpoint_path}")
 
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    if missing:
-        logger.warning(f"Missing keys when loading checkpoint: {len(missing)}")
-    if unexpected:
-        logger.warning(f"Unexpected keys when loading checkpoint: {len(unexpected)}")
-    CONFIG["action_horizon"] = int(getattr(model, "num_actions", CONFIG["action_horizon"]))
-    CONFIG["image_size"] = int(getattr(model, "image_size", CONFIG["image_size"]))
-    model = model.to(device)
-    model.eval()
+    try:
+        model.load_state_dict(state_dict, strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Checkpoint is incompatible with the current Cross-Self network structure."
+        ) from exc
+    del state_dict
+
+    if model.action_mode != "libero_joint":
+        raise ValueError(
+            f"LIBERO evaluation requires action_mode='libero_joint', got {model.action_mode!r}."
+        )
+    if model.num_views < 2:
+        raise ValueError(f"Model num_views={model.num_views} cannot hold both LIBERO views")
+
+    resolved_norm_stats = _resolve_norm_stats_path(checkpoint_path, norm_stats_path)
+    logger.info(f"Loading norm stats from: {resolved_norm_stats}")
+    model.action_space.load_norm_stats(str(resolved_norm_stats))
     
-    smolvlm_path = smolvlm_model_path or "HuggingFaceTB/SmolVLM-500M-Instruct"
-    processor = SmolVLMVLAProcessor.from_pretrained(
-        smolvlm_path,
+    processor = SmolVLMVLAProcessor(
+        smolvlm_model_path=resolved_smolvlm_path,
         num_views=model.num_views,
         image_size=model.image_size,
         language_max_length=getattr(model.config, "language_max_length", 96),
     )
-    
-    if norm_stats_path and os.path.exists(norm_stats_path):
-        logger.info(f"Loading norm stats from: {norm_stats_path}")
-        model.action_space.load_norm_stats(norm_stats_path)
-        if hasattr(model.action_space, 'state_norm_stats') and model.action_space.state_norm_stats:
-            logger.info(f"   State norm: mean={model.action_space.state_norm_stats.mean[:3].tolist()}")
-        if hasattr(model.action_space, 'action_norm_stats') and model.action_space.action_norm_stats:
-            logger.info(f"   Action norm: mean={model.action_space.action_norm_stats.mean[:3].tolist()}")
-    else:
-        logger.warning("No norm_stats loaded!")
-    
-    logger.info(f"Model loaded! Device: {device}, Image size: {CONFIG['image_size']}x{CONFIG['image_size']}")
+
+    CONFIG["action_horizon"] = int(model.num_actions)
+    CONFIG["action_dim"] = int(model.action_space.dim_action)
+    CONFIG["state_dim"] = int(model.action_space.dim_proprio)
+    CONFIG["image_size"] = int(model.image_size)
+    CONFIG["denoising_steps"] = max(1, int(denoising_steps))
+    image_transform = _build_image_transform(model.image_size)
+
+    model = model.to(device)
+    model.eval()
+
+    logger.info(
+        "Model loaded: device=%s, views=%d, image=%dx%d, action_horizon=%d, denoising_steps=%d",
+        device,
+        model.num_views,
+        CONFIG["image_size"],
+        CONFIG["image_size"],
+        CONFIG["action_horizon"],
+        CONFIG["denoising_steps"],
+    )
 
 
 def preprocess_images(image0: np.ndarray, image1: np.ndarray):
     """Preprocess images to model input format."""
-    image_size = CONFIG["image_size"]
-    
-    transform = transforms.Compose([
-        transforms.Resize((image_size, image_size)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-    ])
-    
-    img0 = Image.fromarray(image0.astype(np.uint8))
-    img1 = Image.fromarray(image1.astype(np.uint8))
-    
-    img0_t = transform(img0)
-    img1_t = transform(img1)
-    
-    if model is None:
+    if model is None or image_transform is None:
         raise RuntimeError("Model must be loaded before preprocessing images")
-    if model.num_views < 2:
-        raise ValueError(f"Model num_views={model.num_views} cannot hold both LIBERO views")
+
+    def prepare_image(image: np.ndarray, name: str) -> torch.Tensor:
+        image = np.asarray(image)
+        if image.ndim != 3 or image.shape[-1] != 3:
+            raise ValueError(f"{name} must have shape [H, W, 3], got {image.shape}")
+        image = np.clip(image, 0, 255).astype(np.uint8, copy=False)
+        return image_transform(Image.fromarray(image))
+
+    img0_t = prepare_image(image0, "observation/image")
+    img1_t = prepare_image(image1, "observation/wrist_image")
 
     views = [img0_t, img1_t]
     views.extend(torch.zeros_like(img0_t) for _ in range(model.num_views - 2))
@@ -170,62 +298,56 @@ def decode_numpy(obj):
 def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
     """Run inference on a single observation."""
     global model, processor
-    
-    try:
-        # Extract observation fields
-        image0 = observation.get("observation/image")
-        image1 = observation.get("observation/wrist_image")
-        state = observation.get("observation/state", np.zeros(8))
-        prompt = observation.get("prompt", "")
-        
-        # Decode msgpack_numpy format if needed
-        image0 = decode_numpy(image0)
-        image1 = decode_numpy(image1)
-        state = decode_numpy(state)
-        
-        # Ensure numpy arrays
-        if not isinstance(image0, np.ndarray):
-            image0 = np.array(image0, dtype=np.uint8)
-        if not isinstance(image1, np.ndarray):
-            image1 = np.array(image1, dtype=np.uint8)
-        if not isinstance(state, np.ndarray):
-            state = np.array(state, dtype=np.float32)
-        
-        if len(state) < 8:
-            state = np.pad(state, (0, 8 - len(state)))
-        state = state[:8]
-        
-        # Preprocess images
-        images, image_mask = preprocess_images(image0, image1)
-        images = images.to(device)
-        image_mask = image_mask.to(device)
-        
-        # Encode language instruction
-        lang = processor.encode_language([prompt])
-        lang = {k: v.to(device) for k, v in lang.items()}
-        
-        # Proprioception
-        proprio_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
-        
-        # Inference
-        with torch.no_grad():
-            actions = model.generate_actions(
-                input_ids=lang['input_ids'],
-                text_attention_mask=lang["text_attention_mask"],
-                image_input=images,
-                image_mask=image_mask,
-                proprio=proprio_tensor,
-                steps=CONFIG["action_horizon"],
-            )
-        
-        actions = actions.cpu().numpy()[0]
-        
-        return {"actions": actions}
-        
-    except Exception as e:
-        logger.error(f"Inference error: {e}")
-        traceback.print_exc()
-        return {"actions": np.zeros((CONFIG["action_horizon"], CONFIG["action_dim"]))}
+
+    if model is None or processor is None:
+        raise RuntimeError("Model must be loaded before inference")
+
+    image0 = decode_numpy(observation.get("observation/image"))
+    image1 = decode_numpy(observation.get("observation/wrist_image"))
+    state = decode_numpy(observation.get("observation/state"))
+    prompt = observation.get("prompt", "")
+
+    if image0 is None or image1 is None:
+        raise ValueError("Both agent-view and wrist-view images are required")
+    if state is None:
+        raise ValueError("observation/state is required")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("A non-empty prompt is required")
+
+    state = np.array(state, dtype=np.float32, copy=True).reshape(-1)
+    if state.size != CONFIG["state_dim"]:
+        raise ValueError(
+            f"observation/state must contain {CONFIG['state_dim']} values, got {state.size}"
+        )
+    if not np.isfinite(state).all():
+        raise ValueError("observation/state contains non-finite values")
+
+    images, image_mask = preprocess_images(image0, image1)
+    images = images.to(device)
+    image_mask = image_mask.to(device)
+    lang = {
+        key: value.to(device)
+        for key, value in processor.encode_language([prompt]).items()
+    }
+    proprio_tensor = torch.from_numpy(state).unsqueeze(0).to(device)
+
+    with torch.inference_mode(), _autocast_context():
+        actions = model.generate_actions(
+            input_ids=lang["input_ids"],
+            text_attention_mask=lang["text_attention_mask"],
+            image_input=images,
+            image_mask=image_mask,
+            proprio=proprio_tensor,
+            steps=CONFIG["denoising_steps"],
+        )
+
+    actions = actions.float().cpu().numpy()[0]
+    expected_shape = (CONFIG["action_horizon"], CONFIG["action_dim"])
+    if actions.shape != expected_shape:
+        raise RuntimeError(f"Model returned actions with shape {actions.shape}, expected {expected_shape}")
+    if not np.isfinite(actions).all():
+        raise RuntimeError("Model returned non-finite actions")
+    return {"actions": actions}
 
 
 async def handle_connection(websocket, path=None):
@@ -238,6 +360,7 @@ async def handle_connection(websocket, path=None):
             "model": "SimVLA",
             "action_dim": CONFIG["action_dim"],
             "action_horizon": CONFIG["action_horizon"],
+            "denoising_steps": CONFIG["denoising_steps"],
             "image_size": CONFIG["image_size"],
         }
         if HAS_MSGPACK:
@@ -278,8 +401,11 @@ async def handle_connection(websocket, path=None):
             except Exception as e:
                 logger.error(f"Error processing message: {e}")
                 traceback.print_exc()
-                error_msg = f"Error: {str(e)}"
-                await websocket.send(error_msg)
+                error_data = {"error": str(e)}
+                if HAS_MSGPACK:
+                    await websocket.send(msgpack.packb(error_data, use_bin_type=True))
+                else:
+                    await websocket.send(json.dumps(error_data))
                 
     except websockets.exceptions.ConnectionClosed:
         pass
@@ -301,10 +427,11 @@ def main():
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Path to SimVLA checkpoint")
     parser.add_argument("--norm_stats", type=str, default=None,
-                        help="Path to normalization stats JSON")
-    parser.add_argument("--smolvlm_model", type=str, 
-                        default="HuggingFaceTB/SmolVLM-500M-Instruct",
-                        help="SmolVLM model path or HuggingFace repo")
+                        help="Path to normalization stats JSON; inferred from training_config.json when omitted")
+    parser.add_argument("--smolvlm_model", type=str, default=None,
+                        help="SmolVLM model path or HuggingFace repo; can also use SMOLVLM_MODEL_PATH")
+    parser.add_argument("--denoising_steps", type=int, default=10,
+                        help="Number of Euler flow-matching denoising steps")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     
@@ -313,11 +440,17 @@ def main():
     if not HAS_MSGPACK:
         logger.warning("msgpack_numpy not installed! Install with: pip install msgpack-numpy")
     
-    load_model(args.checkpoint, args.norm_stats, args.smolvlm_model)
+    load_model(
+        args.checkpoint,
+        args.norm_stats,
+        args.smolvlm_model,
+        args.denoising_steps,
+    )
     
     logger.info(f"Starting SimVLA server on {args.host}:{args.port}")
     logger.info(f"  Image size: {CONFIG['image_size']}x{CONFIG['image_size']}")
     logger.info(f"  Action horizon: {CONFIG['action_horizon']}")
+    logger.info(f"  Denoising steps: {CONFIG['denoising_steps']}")
     
     asyncio.run(serve(args.host, args.port))
 

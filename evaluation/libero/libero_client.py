@@ -22,6 +22,22 @@ from pathlib import Path
 from typing import Deque, Dict, List, Optional
 
 
+def _bootstrap_cli_value(flag: str) -> Optional[str]:
+    """Read path arguments before importing LIBERO, which needs them at import time."""
+    for index, argument in enumerate(sys.argv[1:], start=1):
+        if argument == flag and index + 1 < len(sys.argv):
+            return sys.argv[index + 1]
+        prefix = f"{flag}="
+        if argument.startswith(prefix):
+            return argument[len(prefix):]
+    return None
+
+
+_cli_libero_root = _bootstrap_cli_value("--libero_root")
+if _cli_libero_root:
+    os.environ["LIBERO_ROOT"] = _cli_libero_root
+
+
 def _has_libero_benchmark_layout(path: Path) -> bool:
     return (
         (path / "bddl_files").is_dir()
@@ -103,11 +119,16 @@ def _resolve_libero_dataset_root(benchmark_root: Path) -> Path:
         if os.environ.get(env_name):
             return Path(os.environ[env_name]).expanduser().resolve()
 
-    simvla_datasets = Path(__file__).resolve().parents[2] / "datasets"
-    if simvla_datasets.exists():
-        return simvla_datasets.resolve()
-
     return (benchmark_root.parent / "datasets").resolve()
+
+
+def _prepare_runtime_cache(benchmark_root: Path) -> None:
+    digest = hashlib.sha1(str(benchmark_root).encode("utf-8")).hexdigest()[:12]
+    base_dir = Path(os.environ.get("TMPDIR", "/tmp")).expanduser()
+    cache_root = base_dir / f"simvla_libero_cache_{digest}"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("NUMBA_CACHE_DIR", str(cache_root / "numba"))
+    os.environ.setdefault("MPLCONFIGDIR", str(cache_root / "matplotlib"))
 
 
 def _write_libero_config(config_file: Path, benchmark_root: Path) -> None:
@@ -130,10 +151,11 @@ def _write_libero_config(config_file: Path, benchmark_root: Path) -> None:
 
 
 def _prepare_libero_config() -> None:
+    benchmark_root = _resolve_libero_benchmark_root()
+    _prepare_runtime_cache(benchmark_root)
     if os.environ.get("SIMVLA_AUTO_LIBERO_CONFIG", "1").lower() in {"0", "false", "no"}:
         return
 
-    benchmark_root = _resolve_libero_benchmark_root()
     repo_config_dir = Path(__file__).resolve().parent / ".libero_config"
     env_config_dir = os.environ.get("LIBERO_CONFIG_PATH")
     explicit_root = bool(os.environ.get("LIBERO_ROOT") or os.environ.get("SIMVLA_LIBERO_ROOT"))
@@ -200,6 +222,28 @@ benchmark_dict = benchmark.get_benchmark_dict()
 # -----------------------------------------------------------------------------
 # Utilities
 # -----------------------------------------------------------------------------
+def _extract_action_chunk(result: Dict, replan_steps: int) -> np.ndarray:
+    if not isinstance(result, dict):
+        raise RuntimeError(f"Policy server returned {type(result).__name__}, expected a mapping")
+    if result.get("error"):
+        raise RuntimeError(f"Policy server error: {result['error']}")
+    if "actions" not in result:
+        raise RuntimeError("Policy server response does not contain 'actions'")
+
+    action_chunk = np.asarray(result["actions"], dtype=np.float32)
+    if action_chunk.ndim != 2 or action_chunk.shape[1] != 7:
+        raise RuntimeError(
+            f"Policy server returned action shape {action_chunk.shape}, expected [T, 7]"
+        )
+    if action_chunk.shape[0] < replan_steps:
+        raise RuntimeError(
+            f"Need {replan_steps} planned actions, got {action_chunk.shape[0]}"
+        )
+    if not np.isfinite(action_chunk).all():
+        raise RuntimeError("Policy server returned non-finite actions")
+    return action_chunk
+
+
 def _quat2axisangle(quat: np.ndarray) -> np.ndarray:
     """
     Convert quaternion [x, y, z, w] to axis-angle representation.
@@ -268,14 +312,7 @@ class WebSocketClient:
             
             # Query server
             result = self.client.infer(element)
-            action_chunk = result["actions"]
-            
-            # Ensure numpy array
-            if not isinstance(action_chunk, np.ndarray):
-                action_chunk = np.array(action_chunk)
-            
-            assert len(action_chunk) >= self.replan_steps, \
-                f"Need {self.replan_steps} steps but got {len(action_chunk)}"
+            action_chunk = _extract_action_chunk(result, self.replan_steps)
             
             for i in range(min(self.replan_steps, len(action_chunk))):
                 self.action_plan.append(action_chunk[i])
@@ -329,7 +366,7 @@ class HTTPClient:
             }
             
             result = self.infer(element)
-            action_chunk = result["actions"]
+            action_chunk = _extract_action_chunk(result, self.replan_steps)
             
             for action in action_chunk[:self.replan_steps]:
                 self.action_plan.append(action)
@@ -480,6 +517,12 @@ def main():
     parser = argparse.ArgumentParser("LIBERO Evaluation Client")
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--libero_root",
+        type=str,
+        default=os.environ.get("LIBERO_ROOT"),
+        help="Path to the LIBERO repository; equivalent to setting LIBERO_ROOT",
+    )
     parser.add_argument("--connection_info", type=str, default=None,
                         help="Path to server connection info JSON")
     parser.add_argument("--client_type", type=str, default="websocket",
