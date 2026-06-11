@@ -26,7 +26,7 @@ export CUDA_VISIBLE_DEVICES=0
 export SMOLVLM_MODEL_PATH=pretrained/SmolVLM-500M-Instruct
 
 python -u evaluation/libero/serve_smolvlm_libero.py \
-    --checkpoint runs/libero_object_cross_self/ckpt-20000 \
+    --checkpoint runs/libero_object_cross_self/ckpt-100000 \
     --norm_stats norm_stats/libero_object_norm.json \
     --host 127.0.0.1 \
     --port 8102

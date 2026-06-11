@@ -1,4 +1,6 @@
 /.codex
+__pycache__/
+*.py[cod]
 /datasets/metas/
 /.idea
 /evaluation/libero/eval_results/
@@ -8,4 +10,6 @@
 /具体代码计划.md
 /.vscode/
 /eval_results/
+/eval_results_libero_pro/
+/third_party/
 /修改总结.md

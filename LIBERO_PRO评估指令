@@ -1,0 +1,185 @@
+# 当前版本 LIBERO-PRO 评估指令
+
+LIBERO-PRO 评测继续使用普通 LIBERO 的 MyVLA 模型服务：
+
+```text
+AgentView + WristView
+8D proprio -> MyVLA -> 7D delta action
+```
+
+评测时需要两个终端：
+
+- 终端 1：在 `simvla` 环境中启动模型服务。
+- 终端 2：在 `libero` 环境中运行 LIBERO-PRO 仿真。
+
+以下命令均从 MyVLA 仓库根目录执行。路径不写死在 Python 代码中，可通过
+环境变量或命令行参数传入。
+
+## 一、准备 LIBERO-PRO
+
+```bash
+conda activate libero
+cd /mnt/data/MyVLA
+
+export LIBERO_PRO_ROOT=/mnt/data/LIBERO-PRO/LIBERO-PRO
+export LIBERO_PRO_DATA_ROOT=/mnt/data/LIBERO-PRO/LIBERO-PRO-data
+
+bash evaluation/libero_pro/setup_libero_pro.sh
+```
+
+如果不设置上面两个变量，默认下载到：
+
+```text
+MyVLA/third_party/LIBERO-PRO
+MyVLA/third_party/LIBERO-PRO-data
+```
+
+也可以完全使用参数：
+
+```bash
+bash evaluation/libero_pro/setup_libero_pro.sh \
+    --libero_pro_root /mnt/data/LIBERO-PRO/LIBERO-PRO \
+    --libero_pro_data_root /mnt/data/LIBERO-PRO/LIBERO-PRO-data
+```
+
+先检查路径、suite 注册和数据文件是否正确：
+
+```bash
+python -u evaluation/libero_pro/libero_pro_client.py \
+    --libero_pro_root "$LIBERO_PRO_ROOT" \
+    --libero_pro_data_root "$LIBERO_PRO_DATA_ROOT" \
+    --task_suite libero_object \
+    --perturbation position \
+    --validate_only
+```
+
+评测脚本会创建临时 `LIBERO_CONFIG_PATH`，不会修改 `~/.libero`，也不会
+修改 LIBERO-PRO 源码目录中的配置。
+
+## 二、终端 1：启动模型服务
+
+```bash
+conda activate simvla
+cd /mnt/data/MyVLA
+
+export PYTHONNOUSERSITE=1
+export CUDA_VISIBLE_DEVICES=0
+export SMOLVLM_MODEL_PATH=pretrained/SmolVLM-500M-Instruct
+
+python -u evaluation/libero/serve_smolvlm_libero.py \
+    --checkpoint runs/libero_object_cross_self/ckpt-100000 \
+    --norm_stats norm_stats/libero_object_norm.json \
+    --host 127.0.0.1 \
+    --port 8102
+```
+
+正式评估建议保持默认 `--denoising_steps 10`。
+
+## 三、终端 2：评估单个 LIBERO-PRO 设置
+
+以下示例评估 `LIBERO_OBJECT` 的位置扰动：
+
+```bash
+conda activate libero
+cd /mnt/data/MyVLA
+
+export LIBERO_PRO_ROOT=/mnt/data/LIBERO-PRO/LIBERO-PRO
+export LIBERO_PRO_DATA_ROOT=/mnt/data/LIBERO-PRO/LIBERO-PRO-data
+export MUJOCO_GL=egl
+
+bash evaluation/libero_pro/run_eval_libero_pro.sh \
+    --host 127.0.0.1 \
+    --port 8102 \
+    --task_suite libero_object \
+    --perturbation position \
+    --num_trials 20 \
+    --max_steps 300 \
+    --replan_steps 5 \
+    --video_out ./eval_results_libero_pro
+```
+
+`--task_suite` 支持：
+
+```text
+libero_goal
+libero_spatial
+libero_10
+libero_object
+```
+
+`--perturbation` 支持：
+
+```text
+object       物体外观或类别扰动
+position     位置/布局交换，对应官方 suite 后缀 swap
+semantic     指令语义改写，对应官方 suite 后缀 lan
+task         任务扰动
+environment  环境扰动，需要先生成数据
+```
+
+快速检查完整链路：
+
+```bash
+bash evaluation/libero_pro/run_eval_libero_pro.sh \
+    --host 127.0.0.1 \
+    --port 8102 \
+    --task_suite libero_object \
+    --perturbation position \
+    --task_ids 0 \
+    --num_trials 1 \
+    --max_steps 20 \
+    --no_video
+```
+
+不使用环境变量时，可在评测命令中直接增加：
+
+```bash
+--libero_pro_root /path/to/LIBERO-PRO
+--libero_pro_data_root /path/to/LIBERO-PRO-data
+```
+
+如果 `python` 不是当前 `libero` 环境解释器，可设置：
+
+```bash
+export PYTHON_BIN=/path/to/libero/env/bin/python
+```
+
+## 四、生成 environment 扰动数据
+
+官方预生成数据包含 `object`、`position`、`semantic` 和 `task`，不包含
+`environment`。评估 environment 前先执行：
+
+```bash
+bash evaluation/libero_pro/prepare_environment_suite.sh libero_object \
+    --libero_pro_root "$LIBERO_PRO_ROOT" \
+    --libero_pro_data_root "$LIBERO_PRO_DATA_ROOT"
+```
+
+将 `libero_object` 替换为 `all` 可生成四个 base suite。该过程需要渲染
+新的初始状态，耗时明显长于普通评测准备。
+
+## 五、评估全部 20 个设置
+
+先为四个 base suite 生成 environment 数据，然后运行：
+
+```bash
+bash evaluation/libero_pro/run_eval_libero_pro.sh \
+    --host 127.0.0.1 \
+    --port 8102 \
+    --all \
+    --num_trials 50 \
+    --no_video
+```
+
+结果会按官方实际 suite 名保存，例如：
+
+```text
+eval_results_libero_pro/libero_object_object/
+eval_results_libero_pro/libero_object_swap/
+eval_results_libero_pro/libero_object_lan/
+eval_results_libero_pro/libero_object_task/
+eval_results_libero_pro/libero_object_env/
+```
+
+当前 checkpoint 只使用 `LIBERO_OBJECT` 训练时，应优先报告
+`libero_object` 在五种扰动上的成功率。
