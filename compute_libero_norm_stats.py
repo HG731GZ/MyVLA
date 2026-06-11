@@ -21,33 +21,18 @@ Usage:
 """
 
 import argparse
-import json
-import os
-import glob
-import re
-from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import h5py
 from tqdm import tqdm
 from scipy.spatial.transform import Rotation as R
 
-
-EXPECTED_SUBSET_FILES = {
-    "libero_10": 10,
-    "libero_goal": 10,
-    "libero_object": 10,
-    "libero_spatial": 10,
-    "libero_90": 90,
-}
-EXPECTED_DEMOS_PER_FILE = 50
-EXPECTED_FULL_LIBERO_STEPS = 1007618
-REQUIRED_NORM_KEYS = (
-    "actions",
-    "obs/ee_pos",
-    "obs/ee_ori",
-    "obs/gripper_states",
+from libero_dataset_utils import (
+    atomic_json_dump,
+    scan_libero_dataset,
+    snapshot_manifest,
+    validate_official_counts,
 )
 
 
@@ -79,117 +64,6 @@ def euler_to_axisangle(euler: np.ndarray) -> np.ndarray:
     for i in range(len(quats)):
         axis_angles[i] = _quat2axisangle_single(quats[i])
     return axis_angles
-
-
-def resolve_subset_dirs(data_dir: str, subsets: List[str]) -> List[tuple[str, str]]:
-    """Resolve LIBERO subset names to existing directories.
-
-    Supports both flat layouts:
-      datasets/metas/libero_10
-
-    and the official grouped layout used here:
-      datasets/metas/libero_100/libero_10
-      datasets/metas/libero_100/libero_90
-    """
-    resolved: List[tuple[str, str]] = []
-
-    def add_subset(label: str, rel_path: str) -> None:
-        subset_dir = os.path.join(data_dir, rel_path)
-        if os.path.exists(subset_dir):
-            resolved.append((label, subset_dir))
-        else:
-            print(f"Warning: Skipping non-existent directory: {subset_dir}")
-
-    for subset in subsets:
-        normalized = subset.strip("/").replace("\\", "/")
-
-        if normalized == "libero_100":
-            add_subset("libero_10", "libero_100/libero_10")
-            add_subset("libero_90", "libero_100/libero_90")
-        elif normalized in {"libero_10", "libero_90"}:
-            flat_dir = os.path.join(data_dir, normalized)
-            nested_rel = f"libero_100/{normalized}"
-            if os.path.exists(flat_dir):
-                resolved.append((normalized, flat_dir))
-            else:
-                add_subset(normalized, nested_rel)
-        else:
-            label = os.path.basename(normalized)
-            add_subset(label, normalized)
-
-    return resolved
-
-
-def format_h5_errors(errors: List[Dict[str, str]]) -> str:
-    lines = ["Unreadable or invalid HDF5 files:"]
-    for item in errors:
-        lines.append(f"  - [{item['subset']}] {item['path']}: {item['error']}")
-    return "\n".join(lines)
-
-
-def inspect_h5_for_norm(h5_path: str) -> tuple[int, int]:
-    """Validate one LIBERO HDF5 file and return (num_demos, num_steps)."""
-    num_demos = 0
-    num_steps = 0
-
-    with h5py.File(h5_path, "r") as f:
-        if "data" not in f:
-            raise ValueError("missing data group")
-
-        demo_keys = [k for k in f["data"].keys() if k.startswith("demo")]
-        if not demo_keys:
-            raise ValueError("no demo_* groups found")
-
-        for demo_key in demo_keys:
-            demo = f["data"][demo_key]
-            for required_key in REQUIRED_NORM_KEYS:
-                if required_key not in demo:
-                    raise ValueError(f"{demo_key} missing {required_key}")
-
-            lengths = [len(demo[key]) for key in REQUIRED_NORM_KEYS]
-            T = min(lengths)
-            if T <= 0:
-                raise ValueError(f"{demo_key} has empty required data")
-
-            num_demos += 1
-            num_steps += T
-
-    return num_demos, num_steps
-
-
-def validate_expected_counts(
-    subset_stats: Dict[str, Dict[str, int]],
-    total_steps: int,
-    allow_incomplete: bool,
-) -> None:
-    if allow_incomplete:
-        return
-
-    problems = []
-    for subset, expected_files in EXPECTED_SUBSET_FILES.items():
-        if subset not in subset_stats:
-            continue
-
-        expected_demos = expected_files * EXPECTED_DEMOS_PER_FILE
-        actual_files = subset_stats[subset]["num_files"]
-        actual_demos = subset_stats[subset]["num_demos"]
-        if actual_files != expected_files:
-            problems.append(f"{subset}: {actual_files} files, expected {expected_files}")
-        if actual_demos != expected_demos:
-            problems.append(f"{subset}: {actual_demos} demos, expected {expected_demos}")
-
-    if set(subset_stats) == set(EXPECTED_SUBSET_FILES) and total_steps != EXPECTED_FULL_LIBERO_STEPS:
-        problems.append(
-            f"full LIBERO: {total_steps} steps, expected {EXPECTED_FULL_LIBERO_STEPS}"
-        )
-
-    if problems:
-        detail = "\n".join(f"  - {p}" for p in problems)
-        raise RuntimeError(
-            "LIBERO dataset/norm preflight does not match the official full split. "
-            "Re-download the affected subset/files or pass --allow_incomplete for debugging only.\n"
-            f"{detail}"
-        )
 
 
 class RunningStats:
@@ -267,6 +141,8 @@ def compute_norm_stats(
     skip_bad_files: bool = False,
     allow_incomplete: bool = False,
     validate_only: bool = False,
+    dataset_snapshot: Dict[str, Any] | None = None,
+    exclude_patterns: List[str] | None = None,
 ) -> Dict[str, Dict[str, np.ndarray]]:
     """
     Compute LIBERO dataset normalization statistics.
@@ -291,67 +167,34 @@ def compute_norm_stats(
     print(f"   State dimension: 8 [ee_pos(3), {ori_label}(3), gripper(2)]")
     print(f"   Actions dimension: 7 [delta_xyz(3), delta_euler(3), gripper_cmd(1)]")
     
-    resolved_subsets = resolve_subset_dirs(data_dir, subsets)
-    valid_files_by_subset: Dict[str, List[str]] = {}
-    subset_stats: Dict[str, Dict[str, int]] = {}
-    bad_files: List[Dict[str, str]] = []
-    expected_total_demos = 0
-    expected_total_steps = 0
-
     print("\nPreflight validation")
-    for subset, subset_dir in resolved_subsets:
-        h5_files = sorted(glob.glob(os.path.join(subset_dir, "*.hdf5")))
-        valid_files_by_subset[subset] = []
-        subset_files = 0
-        subset_demos = 0
-        subset_steps = 0
-
-        print(f"   Checking {subset}: {len(h5_files)} files")
-        for h5_path in h5_files:
-            try:
-                num_demos, num_steps = inspect_h5_for_norm(h5_path)
-            except Exception as e:
-                bad_files.append({
-                    "subset": subset,
-                    "path": h5_path,
-                    "error": str(e),
-                })
-                if skip_bad_files:
-                    print(f"Warning: Skipping unreadable or invalid file: {h5_path}: {e}")
-                    continue
-                continue
-
-            valid_files_by_subset[subset].append(h5_path)
-            subset_files += 1
-            subset_demos += num_demos
-            subset_steps += num_steps
-
-        subset_stats[subset] = {
-            "num_files": subset_files,
-            "num_demos": subset_demos,
-            "num_steps": subset_steps,
-        }
-        expected_total_demos += subset_demos
-        expected_total_steps += subset_steps
-        print(f"      readable: {subset_files} files, {subset_demos} demos, {subset_steps} steps")
-
-    if bad_files and not skip_bad_files:
-        raise RuntimeError(
-            f"Found {len(bad_files)} bad HDF5 file(s). "
-            "The official full LIBERO split should not skip any files.\n"
-            f"{format_h5_errors(bad_files)}"
-        )
-
-    validate_expected_counts(
-        subset_stats,
-        expected_total_steps,
-        allow_incomplete or skip_bad_files,
+    snapshot = dataset_snapshot or scan_libero_dataset(
+        data_dir,
+        subsets,
+        skip_bad_files=skip_bad_files,
+        exclude_patterns=exclude_patterns or (),
     )
+    validate_official_counts(
+        snapshot,
+        allow_incomplete=allow_incomplete or skip_bad_files,
+    )
+    valid_files_by_subset: Dict[str, List[str]] = {
+        subset: [] for subset in snapshot["subset_stats"]
+    }
+    for item in snapshot["files"]:
+        valid_files_by_subset[item["subset"]].append(item["path"])
+
+    for subset, stats in snapshot["subset_stats"].items():
+        print(
+            f"   {subset}: {stats['num_files']} files, "
+            f"{stats['num_demos']} demos, {stats['num_steps']} steps"
+        )
+    print(f"   Dataset fingerprint: {snapshot['dataset_fingerprint']}")
 
     if validate_only:
         print("\nValidation complete")
-        print(f"   Total demos: {expected_total_demos}")
-        print(f"   Total steps: {expected_total_steps}")
+        print(f"   Total demos: {snapshot['num_demos']}")
+        print(f"   Total steps: {snapshot['num_steps']}")
         return {}
 
     # Initialize statistics
@@ -418,11 +261,11 @@ def compute_norm_stats(
     print(f"   Total demos: {total_demos}")
     print(f"   Total steps: {total_steps}")
 
-    if total_demos != expected_total_demos or total_steps != expected_total_steps:
+    if total_demos != snapshot["num_demos"] or total_steps != snapshot["num_steps"]:
         raise RuntimeError(
             "Computed sample counts differ from preflight validation: "
             f"{total_demos} demos/{total_steps} steps vs "
-            f"{expected_total_demos} demos/{expected_total_steps} steps"
+            f"{snapshot['num_demos']} demos/{snapshot['num_steps']} steps"
         )
     
     # Get statistics
@@ -452,9 +295,6 @@ def compute_norm_stats(
     
     # Save results
     if output_path:
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        
         save_data = {
             "norm_stats": {
                 "state": {
@@ -471,14 +311,17 @@ def compute_norm_stats(
                 },
             },
             "metadata": {
-                "data_dir": data_dir,
-                "subsets": subsets,
-                "resolved_subsets": [
-                    {"name": name, "path": path} for name, path in resolved_subsets
-                ],
-                "subset_stats": subset_stats,
+                "data_dir": snapshot["data_dir"],
+                "subsets": snapshot["requested_subsets"],
+                "exclude_patterns": snapshot["exclude_patterns"],
+                "excluded_files": snapshot["excluded_files"],
+                "resolved_subsets": snapshot["resolved_subsets"],
+                "subset_stats": snapshot["subset_stats"],
                 "num_demos": total_demos,
                 "num_steps": total_steps,
+                "dataset_fingerprint": snapshot["dataset_fingerprint"],
+                "dataset_fingerprint_version": snapshot["fingerprint_version"],
+                "dataset_manifest": snapshot_manifest(snapshot),
                 "state_dim": 8,
                 "action_dim": 7,
                 "state_orientation_source": "obs/ee_ori euler xyz",
@@ -487,9 +330,7 @@ def compute_norm_stats(
                 "action_labels": action_labels,
             }
         }
-        
-        with open(output_path, "w") as f:
-            json.dump(save_data, f, indent=2)
+        atomic_json_dump(save_data, str(output_path))
             
         print(f"\nSaved to: {output_path}")
         
@@ -516,6 +357,12 @@ def main():
                         help="Skip unreadable files instead of failing (debug only)")
     parser.add_argument("--allow_incomplete", action="store_true",
                         help="Do not enforce official LIBERO file/demo/step counts")
+    parser.add_argument(
+        "--exclude_file",
+        action="append",
+        default=[],
+        help="Exclude an HDF5 basename/relative-path glob; may be repeated",
+    )
     
     args = parser.parse_args()
     
@@ -527,6 +374,7 @@ def main():
         skip_bad_files=args.skip_bad_files,
         allow_incomplete=args.allow_incomplete,
         validate_only=args.validate_only,
+        exclude_patterns=args.exclude_file,
     )
 
 

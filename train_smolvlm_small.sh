@@ -35,10 +35,13 @@ export PYTHONNOUSERSITE=1
 # =============================================================================
 # Path configuration
 # =============================================================================
-LIBERO_DATA_DIR="./datasets/metas"
-NORM_STATS_PATH="./norm_stats/libero_object_norm.json"
-TRAIN_METAS_PATH="./datasets/metas/libero_object_train.json"
-LIBERO_SUBSETS="libero_object"
+LIBERO_DATA_DIR=${LIBERO_DATA_DIR:-./datasets/metas}
+NORM_STATS_PATH=${NORM_STATS_PATH:-./norm_stats/libero_object_norm.json}
+TRAIN_METAS_PATH=${TRAIN_METAS_PATH:-./datasets/metas/libero_object_train.json}
+LIBERO_SUBSETS=${LIBERO_SUBSETS:-libero_object}
+LIBERO_STRICT_VALIDATION=${LIBERO_STRICT_VALIDATION:-1}
+LIBERO_FORCE_REBUILD=${LIBERO_FORCE_REBUILD:-0}
+LIBERO_EXCLUDE_FILES=${LIBERO_EXCLUDE_FILES:-}
 
 # SmolVLM backbone (can be local path or HuggingFace repo)
 SMOLVLM_MODEL=${SMOLVLM_MODEL:-./pretrained/SmolVLM-500M-Instruct}
@@ -69,45 +72,53 @@ NUM_HEADS=12
 ATTENTION_DROPOUT=0.1
 
 # =============================================================================
-# Step 1: Validate dataset and refresh training metadata
+# Step 1: Validate dataset and refresh derived data files
 # =============================================================================
-echo "Refreshing training metadata..."
-python create_libero_meta.py \
-    --data_dir $LIBERO_DATA_DIR \
-    --subsets $LIBERO_SUBSETS \
-    --output $TRAIN_METAS_PATH
-
-# =============================================================================
-# Step 2: Compute normalization statistics (if not exists)
-# =============================================================================
-if [ ! -f "$NORM_STATS_PATH" ]; then
-    echo "Computing normalization statistics..."
-    python compute_libero_norm_stats.py \
-        --data_dir $LIBERO_DATA_DIR \
-        --subsets $LIBERO_SUBSETS \
-        --output $NORM_STATS_PATH
-else
-    python - "$NORM_STATS_PATH" <<'PY'
-import json
-import sys
-
-path = sys.argv[1]
-with open(path) as f:
-    data = json.load(f)
-metadata = data.get("metadata", {})
-subsets = metadata.get("subsets", metadata.get("subset"))
-if isinstance(subsets, str):
-    subsets = [subsets]
-if subsets and "libero_object" not in subsets:
-    raise SystemExit(
-        f"ERROR: {path} was not generated for libero_object: subsets={subsets}"
-    )
-print(f"Existing norm stats OK: subsets={subsets}")
-PY
+read -r -a LIBERO_SUBSET_ARGS <<< "$LIBERO_SUBSETS"
+PREPARE_ARGS=(
+    python prepare_libero_data.py
+    --data_dir "$LIBERO_DATA_DIR"
+    --subsets "${LIBERO_SUBSET_ARGS[@]}"
+    --metadata_output "$TRAIN_METAS_PATH"
+    --norm_stats_output "$NORM_STATS_PATH"
+)
+if [ -n "$LIBERO_EXCLUDE_FILES" ]; then
+    read -r -a LIBERO_EXCLUDE_FILE_ARGS <<< "$LIBERO_EXCLUDE_FILES"
+    for exclude_pattern in "${LIBERO_EXCLUDE_FILE_ARGS[@]}"; do
+        PREPARE_ARGS+=(--exclude_file "$exclude_pattern")
+    done
 fi
 
+case "${LIBERO_STRICT_VALIDATION,,}" in
+    1|true|yes|on)
+        echo "LIBERO completeness validation: strict"
+        ;;
+    0|false|no|off)
+        echo "LIBERO completeness validation: relaxed (leave-out experiment)"
+        PREPARE_ARGS+=(--allow_incomplete)
+        ;;
+    *)
+        echo "ERROR: LIBERO_STRICT_VALIDATION must be 1/0 or true/false"
+        exit 2
+        ;;
+esac
+
+case "${LIBERO_FORCE_REBUILD,,}" in
+    1|true|yes|on)
+        PREPARE_ARGS+=(--force_rebuild)
+        ;;
+    0|false|no|off)
+        ;;
+    *)
+        echo "ERROR: LIBERO_FORCE_REBUILD must be 1/0 or true/false"
+        exit 2
+        ;;
+esac
+
+"${PREPARE_ARGS[@]}"
+
 # =============================================================================
-# Step 3: Build training arguments
+# Step 2: Build training arguments
 # =============================================================================
 ARGS="--output_dir ${OUTPUT_DIR} \
     --train_metas_path ${TRAIN_METAS_PATH} \
@@ -142,7 +153,7 @@ if [ -n "${RESUME_CKPT}" ]; then
 fi
 
 # =============================================================================
-# Step 4: Start training
+# Step 3: Start training
 # =============================================================================
 echo "============================================================"
 echo "Starting SimVLA Training on LIBERO (Small Action Transformer)"

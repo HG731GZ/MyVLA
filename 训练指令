@@ -65,6 +65,74 @@ VLM 前 1000 个 optimizer step 冻结，新动作头从第 1 步开始完整训
 export GRADIENT_ACCUMULATION_STEPS=2
 ```
 
+## 留一任务训练
+
+不需要删除或移动原始 HDF5。通过文件名排除任务，并关闭官方完整集计数校验：
+
+```bash
+export LIBERO_STRICT_VALIDATION=0
+export LIBERO_EXCLUDE_FILES="pick_up_the_milk_and_place_it_in_the_basket_demo.hdf5"
+```
+
+然后正常运行训练命令：
+
+```bash
+bash train_smolvlm_small.sh \
+    32 \
+    0.1 \
+    ./runs/libero_object_cross_self_without_milk
+```
+
+可以使用空格分隔多个文件名或 glob：
+
+```bash
+export LIBERO_EXCLUDE_FILES="*milk*_demo.hdf5 *ketchup*_demo.hdf5"
+```
+
+排除 pattern 如果没有匹配任何 HDF5，脚本会直接报错，避免误把目标任务保留在训练集。
+
+恢复完整数据训练时：
+
+```bash
+unset LIBERO_EXCLUDE_FILES
+export LIBERO_STRICT_VALIDATION=1
+```
+
+不要手工修改 `libero_object_train.json` 来删除任务，因为训练前的自动检查会根据 HDF5 数据重新生成
+该文件。
+
+## 自动刷新派生文件
+
+每次启动训练前，脚本都会计算当前训练数据的指纹。指纹包含：
+
+```text
+subset
+排除规则
+HDF5 相对路径
+文件大小和修改时间
+demo 数
+timestep 数
+```
+
+如果当前数据与以下文件不匹配，脚本会自动重新生成：
+
+```text
+datasets/metas/libero_object_train.json
+norm_stats/libero_object_norm.json
+```
+
+数据和配置没有变化时不会重复计算 norm stats。需要无条件重建时：
+
+```bash
+export LIBERO_FORCE_REBUILD=1
+```
+
+重建完成后建议恢复：
+
+```bash
+unset LIBERO_FORCE_REBUILD
+```
+
 ## 四卡训练
 
 ```bash
